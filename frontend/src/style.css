@@ -1,0 +1,58 @@
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --page-bg: #f4f6fb;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: #1f2937;
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 缺陷等级色带，与后端 severity 取值对应 */
+.severity-none {
+  color: #16a34a;
+}
+.severity-low {
+  color: #ca8a04;
+}
+.severity-medium {
+  color: #ea580c;
+}
+.severity-high {
+  color: #dc2626;
+}
+
+/* 正在检测的单元格脉冲效果 */
+@keyframes pulse-cell {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.cell-active {
+  animation: pulse-cell 1.2s ease-in-out infinite;
+}
+
+/* 滚动条细化，避免长列表把版面撑乱 */
+.thin-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python.exe -m pip install --upgrade pip -q)",
+      "Bash(.venv/Scripts/python.exe -m pip install -r backend/requirements.txt)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c ' *)",
+      "Bash(npm install *)",
+      "Bash(rm -rf data)",
+      "Bash(PYTHONIOENCODING=utf-8 MOCK_LLM=true .venv/Scripts/python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8011)",
+      "Bash(curl -s http://127.0.0.1:8011/api/v1/health)",
+      "Read(//tmp/**)",
+      "Bash(curl -s --max-time 15 http://127.0.0.1:5173/api/v1/health)",
+      "Bash(timeout 12 curl -sN -H \"Accept: text/event-stream\" \"http://127.0.0.1:5173/api/v1/tasks/nonexistent/stream\" -o /dev/null -w \"HTTP %{http_code}\\\\n\")"
+    ]
+  }
+}

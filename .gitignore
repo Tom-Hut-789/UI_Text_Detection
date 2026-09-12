@@ -1,0 +1,27 @@
+# ---- 环境与密钥 ----
+.env
+.venv/
+venv/
+
+# ---- 运行期数据（上传原件、抽取的截图、结果文件、SQLite）----
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Node ----
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
