@@ -13,7 +13,8 @@
       "Bash(curl -s http://127.0.0.1:8011/api/v1/health)",
       "Read(//tmp/**)",
       "Bash(curl -s --max-time 15 http://127.0.0.1:5173/api/v1/health)",
-      "Bash(timeout 12 curl -sN -H \"Accept: text/event-stream\" \"http://127.0.0.1:5173/api/v1/tasks/nonexistent/stream\" -o /dev/null -w \"HTTP %{http_code}\\\\n\")"
+      "Bash(timeout 12 curl -sN -H \"Accept: text/event-stream\" \"http://127.0.0.1:5173/api/v1/tasks/nonexistent/stream\" -o /dev/null -w \"HTTP %{http_code}\\\\n\")",
+      "Bash(.venv/Scripts/python.exe -m py_compile tools/compare_runs.py)"
     ]
   }
 }

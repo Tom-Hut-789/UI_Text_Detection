@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,21 @@ from .excel_parser import ParsedWorkbook, load_manifest, parse_workbook
 from .result_builder import build_result_workbook
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EnglishReference:
+    """同行英文基准，含两个互补来源，任一可为 None。
+
+    * `image_path` —— 几何对照。让模型直接看到「同一控件里英文占多少宽度、译文占多少」，
+      这是文本长度比较给不出的证据；
+    * `text` —— 语义锚点。说明完整文案本该是什么，从英文列的 OCR 结论得来。
+
+    打包成一个参数，是为了避免 `_detect_one` 再多出两个「基准」形参。
+    """
+
+    image_path: Path | None = None
+    text: str | None = None
 
 
 class TaskRunner:
@@ -147,7 +163,6 @@ class TaskRunner:
                 continue
 
             english_col = parsed.english_col
-            english_text: str | None = None
             pending: list[tuple[int, Any]] = []
 
             for col_index, img_ref in sorted(row_images.items()):
@@ -155,23 +170,32 @@ class TaskRunner:
                     continue
                 pending.append((col_index, img_ref))
 
+            # 基准图来自 manifest 的映射表，不会被消费/弹出，因此断点续传时同样拿得到
             english_ref = row_images.get(english_col)
-            # 英文基准优先跑完，再并发小语种——小语种 prompt 需要它做对照
+            reference = EnglishReference(
+                image_path=Path(english_ref.path) if english_ref is not None else None
+            )
+
+            # 英文基准优先跑完，再并发小语种——小语种要用它做对照。
+            # 英文列自己不带基准（它没有可对照的对象），传 None。
             if english_ref is not None and (row_index, english_col) not in done_keys:
                 finding = await self._detect_one(
                     task_id, parsed, row_index, english_col, english_ref, None, counters
                 )
                 findings.append(finding)
-                english_text = _text_of(finding)
+                reference = replace(reference, text=_text_of(finding))
                 pending = [(c, i) for c, i in pending if c != english_col]
             elif (row_index, english_col) in prior:
-                english_text = prior[(row_index, english_col)].extracted_text
+                # 续跑时英文列已在上轮跑过，补上它的 OCR 文本作为语义锚点
+                reference = replace(
+                    reference, text=_verdict_text(prior[(row_index, english_col)])
+                )
 
             if pending:
                 results = await asyncio.gather(
                     *(
                         self._detect_one(
-                            task_id, parsed, row_index, col, img_ref, english_text, counters
+                            task_id, parsed, row_index, col, img_ref, reference, counters
                         )
                         for col, img_ref in pending
                     )
@@ -229,13 +253,22 @@ class TaskRunner:
         row_index: int,
         col_index: int,
         img_ref,
-        english_text: str | None,
+        reference: EnglishReference | None,
         counters: dict[str, int],
     ) -> LanguageFinding:
         column = next((c for c in parsed.columns if c.col_index == col_index), None)
         language = column.language if column else f"列{col_index}"
         is_english = col_index == parsed.english_col
         ctx = parsed.meta_for(row_index)
+
+        # 双图对比的三个前提：开关打开、不是英文列自身（它没有基准）、且确实拿到了基准图。
+        # 任一不满足就自动降级为单图，Prompt 措辞随之切换——缺图不该让整张图检测失败。
+        use_dual = (
+            settings.llm_dual_image
+            and not is_english
+            and reference is not None
+            and reference.image_path is not None
+        )
 
         bus.publish(
             task_id,
@@ -249,9 +282,19 @@ class TaskRunner:
             prompt = (
                 prompts.build_english_prompt(ctx)
                 if is_english
-                else prompts.build_non_english_prompt(language, english_text, ctx)
+                else prompts.build_non_english_prompt(
+                    language,
+                    reference.text if reference else None,
+                    ctx,
+                    has_reference_image=use_dual,
+                )
             )
-            verdict = await llm_client.detect(img_ref.path, prompt, is_english=is_english)
+            verdict = await llm_client.detect(
+                img_ref.path,
+                prompt,
+                is_english=is_english,
+                reference_image_path=reference.image_path if use_dual else None,
+            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             logger.warning("检测失败 row=%s col=%s: %s", row_index, col_index, error)
@@ -313,10 +356,15 @@ def _to_finding(
     )
 
 
-def _text_of(finding: LanguageFinding) -> str | None:
-    if finding.verdict and finding.verdict.extracted_text.strip():
-        return finding.verdict.extracted_text
+def _verdict_text(verdict: DefectVerdict | None) -> str | None:
+    """取结论里的 OCR 文本；空白视为没有（空字符串不能当语义锚点用）。"""
+    if verdict and verdict.extracted_text.strip():
+        return verdict.extracted_text
     return None
+
+
+def _text_of(finding: LanguageFinding) -> str | None:
+    return _verdict_text(finding.verdict)
 
 
 runner = TaskRunner()

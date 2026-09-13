@@ -16,21 +16,64 @@ OPENAI_API_KEY=sk-xxxx
 LLM_MODEL=gpt-4o  # 模型必须具备多模态输入能力
 
 # 或任意兼容网关（Azure OpenAI / 阿里云百炼 / vLLM / One-API …）
-OPENAI_BASE_URL=https://your-gateway.example.com/v1
+OPENAI_BASE_URL=https://your-gateway.example.com/v1   # ⚠ 只填到 /v1，不要带 /chat/completions
 LLM_MODEL=qwen-vl-max
 
 LLM_CONCURRENCY=5      # 全局并发上限，防止触发网关限流
 LLM_IMAGE_DETAIL=high  # 视觉精度；high 对 OCR 与截断判定更准，Token 更高
+LLM_DUAL_IMAGE=true    # 双图对比，见 §4；小语种请求的 prompt token 近乎翻倍
+LLM_DISABLE_THINKING=true  # 关闭推理型模型的思考，见下方「推理循环」
 ```
 
-> 网关不支持 `response_format=json_schema` 时会自动降级为 `json_object` 并做容错解析，
-> 无需手动切换。
+> **模型必须真正具备视觉能力，且务必先用探针确认。** 同一网关下不同模型的差异极大，
+> 实测 `api.deepseek.com` 上 `deepseek-flash` 视觉正常，而 `deepseek-v4-pro` 会直接把图片
+> 丢掉（token 增量仅 +14）并回复「图片格式不支持」——**它不会报错，只会静默给出错误结论**。
+> 另外 `deepseek-ai/DeepSeek-OCR` 这类专用 OCR 模型不能用作本系统的检测模型：它输出的是
+> `<|ref|>table<|/ref|><|det|>...` 这类定位标记，不是 JSON 结论。
+> 换模型后请先跑 `python tools/vision_probe.py`。
 
-### Token 预算
+> **`OPENAI_BASE_URL` 只填到 `/v1` 为止。** OpenAI SDK 会自己在后面拼 `/chat/completions`，
+> 若填成完整端点 `https://host/v1/chat/completions`，实际会请求到
+> `.../chat/completions/chat/completions` 并返回 404——报错发生在运行时，很容易被误判成
+> 网关故障或模型不存在。代码已做归一化并打印告警，但仍建议按规范填写。
+
+> **结构化输出三档自动降级**，无需手动切换：`json_schema` → `json_object` → 不带
+> `response_format`（仅靠 Prompt 里的 JSON 契约 + 解析层的围栏剥离/正则兜底）。
+> 有些网关（如 SiliconFlow 上的部分模型）**整个 JSON 模式都不支持**，第二档同样返回 400
+> 「Json mode is not supported for this model.」——只降一级是不够的，那会让每次调用都以
+> 400 失败。每一档的降级只在进程内发生一次，之后直接走可用档位。
+
+### Token 预算与超时
 
 `LLM_MAX_TOKENS` 默认 2048。若使用**推理型模型**（返回 `reasoning_tokens` 的），
 思考过程同样计入这个额度，取小了会出现「finish_reason=length 且正文为空」。
 系统会显式识别这种截断并给出可读报错，而不是把它当成普通的解析失败。
+
+推理型模型还需要**同步调大 `LLM_TIMEOUT`**：实测 `zai-org/GLM-4.5V` 在
+`LLM_TIMEOUT=60` 下双图请求会连续超时重试。当前 `.env` 取 `LLM_TIMEOUT=180` /
+`LLM_MAX_TOKENS=8192`。
+
+### 推理循环（`LLM_DISABLE_THINKING`）
+
+推理型模型在**文字密集的截图**上会陷入推理循环：把 `max_tokens` 全部耗在隐藏的
+`reasoning` 上，`content` 输出为空，该图必然判定失败。实测缅甸语截图（1208×2644，
+整屏文字）在三种模型上都稳定复现：
+
+| 模型 | 现象 | 结果 |
+| :--- | :--- | :--- |
+| `zai-org/GLM-4.5V` | completion 8458，其中 reasoning 仅 266（**正文**失控） | 2/9 张失败 |
+| `Qwen/Qwen3-VL-8B-Instruct` | 重复同一行缅甸文直到 8191 tokens | 2/9 张失败 |
+| `deepseek-flash` | reasoning 8192，content 0 字符 | 2/9 张失败 |
+
+**加大 `LLM_MAX_TOKENS` 无效**（8192 照样跑满），在 Prompt 里限制转写长度也无效
+（失控发生在看不见的 reasoning 里，不在可见的转写文本里）。
+
+`LLM_DISABLE_THINKING=true` 会发送 `extra_body={"thinking": {"type": "disabled"}}`，
+实测同一张图 completion 从 **8192 降到 361**，全量跑批 9/9 成功、耗时从 216s 降到 10s。
+
+> 该参数格式属于 DeepSeek 系，换其他网关时可能不认识（会被忽略或报 400），
+> 遇到问题先把它设回 `false`。另：`reasoning_effort=low` 也能让请求正常结束，
+> 但仍会消耗 5000+ reasoning token，不如直接关掉。
 
 ---
 
@@ -104,6 +147,33 @@ Prompt 强制要求「只依据截图中可见的像素证据判断」，并明�
 **英文列先于小语种执行**——它的 OCR 结果会作为对照文本传入小语种 Prompt。
 小语种译文通常比英文长 30% 以上，是最主要的截断成因，有基准对照能显著降低漏判。
 
+### 双图对比（`LLM_DUAL_IMAGE`，默认开）
+
+小语种检测会拿到**同行英文基准截图**，与自身截图一起发给模型做视觉几何对照
+（IMAGE 1 = 英文基准，IMAGE 2 = 待检测截图），同时保留英文 OCR 文本作为语义锚点：
+
+| 来源 | 提供的证据 |
+| :--- | :--- |
+| 基准**图片** | 几何证据——同一控件里英文占多少宽度、译文占多少、行数与四周留白 |
+| 英文**文本** | 语义证据——完整文案本该是什么 |
+
+截断本质是**几何问题**，只比较文本长度会丢掉最关键的证据，因此默认启用。以下情况会自动
+降级为单图（Prompt 措辞随之切换，不报错）：
+
+- `LLM_DUAL_IMAGE=false`；
+- 该行英文列没有截图；
+- 该图本身就是英文列（它没有可对照的基准）。
+
+> **成本**：小语种请求的 prompt token 近乎翻倍（英文列仍是单图）。网关不支持多图输入、
+> 或想控制成本时置 `false` 即可回退。
+
+> **断点续跑会混用两种口径**：`row_results` 里不记录每张图是用哪种模式跑的，
+> 续跑时已完成的图会沿用旧口径结论。切换开关后建议**重跑**而非续跑。
+
+> **上线前建议先验证网关真的吃下了第二张图**：多图输入最危险的失效模式是网关静默丢弃
+> 第二张——请求照样 200、模型照样作答，实际只看了半张。用
+> `python tools/vision_probe.py --dual` 可确定性识别（详见 §8）。
+
 ---
 
 ## 5. 输出文件
@@ -168,7 +238,9 @@ Upload |         |
 │   └── results/                 结果文件
 ├── tools/
 │   ├── vision_probe.py          多模态能力探针（合成图 + 已知文字 + token 计量）
-│   └── llm_check.py             真实截图端到端连通性自检
+│   │                            --dual 验证网关是否真的吃下第二张图
+│   ├── llm_check.py             真实截图端到端连通性自检（默认即走双图生产路径）
+│   └── compare_runs.py          两轮跑批的逐图差异对比（基线 vs 双图）
 ├── start.py / start.bat / start.sh
 └── .env.example
 ```
@@ -217,3 +289,50 @@ SSE 事件类型：`state`（连接即推的当前状态）、`started`、`progr
 
 **单端口部署** — 前端 `npm run build` 后，后端启动时会自动把 `frontend/dist`
 挂到根路径，无需再起 Node 进程。
+
+---
+
+## 8. 自检与验证工具
+
+`tools/` 下三个脚本，按成本从低到高排列。前两个是排查「模型到底看不看得见图」的确定性手段
+——真实业务截图里有没有文字你事先并不知道，模型胡诌一段也无从证伪，所以探针会现场**画**一张
+写着已知随机串的图，结论非黑即白。
+
+| 脚本 | 作用 | 成本 |
+| :--- | :--- | :--- |
+| `vision_probe.py` | 多模态能力探针：合成图 + 已知文字 + token 计量 | 2 次调用 |
+| `vision_probe.py --dual` | 验证网关能否吃下**两张**图 | 2 次调用 |
+| `llm_check.py` | 真实截图走完整生产路径（含双图）的连通性自检 | 2 次调用 |
+| `compare_runs.py` | 两轮跑批的逐图差异对比 | 0（只读本地库） |
+
+```bash
+python tools/vision_probe.py            # 确认模型看得见图
+python tools/vision_probe.py --dual     # 确认网关保留第二张图
+python tools/llm_check.py               # 真实截图端到端（默认双图；--single 走单图对照）
+```
+
+### `compare_runs.py` —— 双图效果验证
+
+双图对比是否真的更好，不能靠肉眼看两份结果表。跑完基线轮与双图轮后：
+
+```bash
+# 1. .env 中 LLM_DUAL_IMAGE=false，跑一遍全量，记下 task_id
+# 2. 改回 LLM_DUAL_IMAGE=true，再跑一遍，记下 task_id
+python tools/compare_runs.py <基线task_id> <双图task_id>
+```
+
+输出两轮各自的缺陷张数与按语种分布，并把逐图差异按**方向**分成四组，附上截图路径：
+
+| 组 | 含义 |
+| :--- | :--- |
+| A | 双图判出更多缺陷 —— 候选「修复漏报」，也可能是「新增误报」 |
+| B | 双图判出更少缺陷 —— 候选「消除误报」，也可能是「新增漏报」 |
+| C | 两侧都判有缺陷，但缺陷种类不同 |
+| D | 只有一侧有有效结论（另一侧跑失败） |
+
+⚠️ **方向不等于好坏**，真假仍需按截图路径人工判读。另外两轮都在英文列上跑的仍是单图，
+该列的差异与双图无关、只反映模型随机性，脚本会单独告警——这个数字明显不为 0 时，
+说明结果本身不够稳定，其余差异也要谨慎采信。
+
+> 若误报明显增多而真实检出没有增加，把 `LLM_DUAL_IMAGE` 默认值改为 `false`，
+> 双图作为可选项保留。

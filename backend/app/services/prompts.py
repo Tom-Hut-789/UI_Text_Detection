@@ -54,6 +54,12 @@ VERDICT_SCHEMA_BLOCK = """{
 }"""
 
 
+# 双图模式下插在两张图片前面的标签。由 ai_agent 复用，保证标签文案与下面的 Prompt
+# 正文表述一致——两处各写一份的话，改了一处就会出现「标签说 IMAGE 2、正文说第二张」的错位。
+IMAGE_1_LABEL = "IMAGE 1 —— 同一控件的英语（English）基准截图（仅作参照，不要对它判定缺陷）："
+IMAGE_2_LABEL = "IMAGE 2 —— 本次要检测的目标语种截图："
+
+
 def build_english_prompt(context: dict | None = None) -> str:
     """英文截图：一次调用同时完成 OCR 与缺陷判定。
 
@@ -74,23 +80,52 @@ def build_english_prompt(context: dict | None = None) -> str:
 
 
 def build_non_english_prompt(
-    language: str, english_reference: str | None = None, context: dict | None = None
+    language: str,
+    english_reference: str | None = None,
+    context: dict | None = None,
+    *,
+    has_reference_image: bool = False,
 ) -> str:
     """小语种截图：结合英文基准判断截断与重叠。
 
-    传入同行的英文 OCR 结果作为参照——同一控件在英文下的完整文案是判断小语种是否被截断的最强线索
-    （小语种文案通常比英文长 30% 以上，是截断的高发区）。
+    英文基准有两个互补来源：
+      * **图片**（`has_reference_image=True`）—— 几何对照。截断本质是几何问题，能直接看到
+        「同一控件里英文占多少宽度、译文占多少」，这是文本长度比较给不出的证据；
+      * **文本**（`english_reference`）—— 语义锚点，说明完整文案本该是什么，成本可忽略。
+    两者都用，比只用其一更稳。缺图时自动降级为纯文本对照。
     """
     ctx = context or {}
     meta = _context_block(ctx)
-    if english_reference:
+
+    if has_reference_image:
+        ref_block = (
+            f"本次提供**两张**截图，请做跨语种对照：\n"
+            f"{IMAGE_1_LABEL}\n"
+            f"{IMAGE_2_LABEL}\n"
+            "对照方法（务必**逐控件**进行，不要整图比大小）：\n"
+            "1. 先在 IMAGE 1 中定位目标控件，再在 IMAGE 2 中找到**同一个**控件；\n"
+            "2. 比较两处文本的**占位宽度与行数**——译文通常比英文长 30% 以上，"
+            "若同一控件内 IMAGE 2 的文本明显更宽、行数更多，或紧贴容器边缘几乎没有留白，"
+            "就是截断的高发信号；\n"
+            "3. 若 IMAGE 2 的文本在容器/控件边界处被硬切、或字符只有一部分可见，"
+            "判定 has_truncation = true。\n\n"
+            "⚠️ 防误报：两张截图的**裁切范围、缩放比例和分辨率可能完全不同**，"
+            "整体尺寸不一致绝不代表存在缺陷。判定只能依据**同一控件内部**的文字及其四周留白。\n"
+        )
+        if english_reference and english_reference.strip():
+            ref_block += (
+                "\n从 IMAGE 1 转写出的英文文案（供语义对照，注意这不是 IMAGE 2 的文案）：\n"
+                f'"""\n{english_reference.strip()}\n"""\n'
+            )
+    elif english_reference:
         ref_block = (
             "同一控件在**英语**界面下的完整文案（供对照，注意不是本截图的文案）：\n"
             f'"""\n{english_reference.strip()}\n"""\n'
             "对照时请注意：小语种译文通常比英文更长，请重点检查本语种是否因文本变长而被容器截断。\n"
+            "（本次没有英文基准截图，请仅依据本截图自身的可见证据判断。）\n"
         )
     else:
-        ref_block = "（本次没有可用的英文基准文案，请仅依据截图自身的可见证据判断。）\n"
+        ref_block = "（本次没有可用的英文基准，请仅依据截图自身的可见证据判断。）\n"
 
     return f"""{meta}任务：这是**{language}**界面的截图，请执行 UI 缺陷检测。
 

@@ -214,8 +214,9 @@ class LLMClient:
         self._client: AsyncOpenAI | None = None
         self._semaphore = asyncio.Semaphore(max(1, settings.llm_concurrency))
         self._encoder = ImageEncoder()
-        # 网关一旦拒绝 json_schema，后续请求直接降级，避免每次都多打一次无效请求
+        # 网关一旦拒绝某种 response_format，后续请求直接降级，避免每次都多打一次无效请求
         self._json_schema_supported = True
+        self._json_object_supported = True
         self._lock = asyncio.Lock()
 
     @property
@@ -237,11 +238,27 @@ class LLMClient:
         prompt: str,
         *,
         is_english: bool = False,
+        reference_image_path: str | Path | None = None,
     ) -> DefectVerdict:
+        """检测单张截图。
+
+        传入 `reference_image_path` 时走**双图对比**：把同一控件的英文基准截图作为
+        IMAGE 1、待检测截图作为 IMAGE 2 一起发送，让模型做几何对照——截断本质是几何
+        问题（同一控件里英文占 60% 宽度、译文占 118%），只比较文本长度会丢掉这个证据。
+        """
         if settings.mock_llm:
             return await self._mock_detect(image_path, is_english=is_english)
 
-        data_url = await asyncio.to_thread(self._encoder.encode, image_path)
+        # 两张图都在重试循环**之外**编码：重试针对的是网络侧瞬时错误，图片本身没变，
+        # 放进循环里会让每次重试都重做一遍读盘 + 降采样 + Base64。
+        if reference_image_path is not None:
+            data_url, ref_data_url = await asyncio.gather(
+                asyncio.to_thread(self._encoder.encode, image_path),
+                asyncio.to_thread(self._encoder.encode, reference_image_path),
+            )
+        else:
+            data_url = await asyncio.to_thread(self._encoder.encode, image_path)
+            ref_data_url = None
 
         async with self._semaphore:
             async for attempt in AsyncRetrying(
@@ -251,22 +268,29 @@ class LLMClient:
                 reraise=True,
             ):
                 with attempt:
-                    return await self._call_model(data_url, prompt)
+                    return await self._call_model(data_url, prompt, ref_data_url)
         raise RuntimeError("unreachable")  # pragma: no cover
 
-    async def _call_model(self, data_url: str, prompt: str) -> DefectVerdict:
+    async def _call_model(
+        self, data_url: str, prompt: str, ref_data_url: str | None = None
+    ) -> DefectVerdict:
+        detail = settings.llm_image_detail
+        content: list[dict] = []
+        if ref_data_url is not None:
+            # 图片之间插入标签，避免模型把「参照图」和「待检图」弄反——顺序错了会直接把
+            # 英文截图自身的排版问题报成小语种缺陷。
+            content.append({"type": "text", "text": prompts.IMAGE_1_LABEL})
+            content.append(
+                {"type": "image_url", "image_url": {"url": ref_data_url, "detail": detail}}
+            )
+            content.append({"type": "text", "text": prompts.IMAGE_2_LABEL})
+        # 无参考图时这一段的顺序与改造前**完全一致**（先图后文），单图路径行为不变
+        content.append({"type": "image_url", "image_url": {"url": data_url, "detail": detail}})
+        content.append({"type": "text", "text": prompt})
+
         messages = [
             {"role": "system", "content": prompts.SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url, "detail": settings.llm_image_detail},
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            },
+            {"role": "user", "content": content},
         ]
         base: dict = {
             "model": settings.llm_model,
@@ -274,11 +298,15 @@ class LLMClient:
             "temperature": settings.temperature,
             "max_tokens": settings.llm_max_tokens,
         }
+        if settings.llm_disable_thinking:
+            # 关掉推理，避免在文字密集的截图上陷入推理循环把额度耗光（详见 config.py 注释）。
+            # 用 extra_body 而非顶层参数：它不在 OpenAI 协议里，是网关的扩展字段。
+            base["extra_body"] = {"thinking": {"type": "disabled"}}
 
         if self._json_schema_supported:
             try:
-                resp = await self.client.chat.completions.create(
-                    **base,
+                return await self._request(
+                    base,
                     response_format={
                         "type": "json_schema",
                         "json_schema": {
@@ -288,17 +316,36 @@ class LLMClient:
                         },
                     },
                 )
-                _log_usage(resp, base["model"])
-                _check_finish_reason(resp)
-                return parse_verdict_json(resp.choices[0].message.content or "")
             except openai.BadRequestError as exc:
                 async with self._lock:
                     self._json_schema_supported = False
                 logger.warning("网关不支持 response_format=json_schema，降级为 json_object：%s", exc)
 
-        resp = await self.client.chat.completions.create(
-            **base, response_format={"type": "json_object"}
-        )
+        if self._json_object_supported:
+            try:
+                return await self._request(base, response_format={"type": "json_object"})
+            except openai.BadRequestError as exc:
+                # 有些网关（如 SiliconFlow 上的部分模型）**整个 JSON 模式都不支持**，
+                # 400 提示 "Json mode is not supported for this model."。
+                # 只降级到 json_object 是不够的——那样每次调用都会以 400 失败。
+                async with self._lock:
+                    self._json_object_supported = False
+                logger.warning(
+                    "网关不支持 response_format=json_object，改为不带 response_format 请求"
+                    "（Prompt 已写明 JSON 契约，解析层另有容错）：%s",
+                    exc,
+                )
+
+        # 最后一档：完全不指定 response_format。Prompt 里的 JSON 结构说明与
+        # parse_verdict_json 的围栏剥离 / 正则兜底共同保证仍能取到结论。
+        return await self._request(base, response_format=None)
+
+    async def _request(self, base: dict, *, response_format: dict | None) -> DefectVerdict:
+        """发一次请求并解析结论；`response_format=None` 表示完全不指定。"""
+        kwargs = dict(base)
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        resp = await self.client.chat.completions.create(**kwargs)
         _log_usage(resp, base["model"])
         _check_finish_reason(resp)
         return parse_verdict_json(resp.choices[0].message.content or "")
